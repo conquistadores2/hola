@@ -343,11 +343,47 @@ DEBOUNCE_RESTORE = 2.0  # segundos de silencio antes de dar por terminado el lot
 _pending_channel_deletes: dict[int, list] = defaultdict(list)
 _last_delete_time: dict[int, float] = {}
 _restore_tasks: dict[int, asyncio.Task] = {}
+# Mapa PERSISTENTE (a propósito no se limpia al terminar un lote) de
+# categorías ya recreadas por el antinuke: guild_id -> {id_categoría_original: categoría_nueva}.
+# Motivo: un nuke grande (muchos canales) casi siempre se reparte en varios
+# lotes, porque el rate-limit de Discord al crear/borrar canales mete más de
+# DEBOUNCE_RESTORE segundos de silencio entre borrados. Sin este mapa, un
+# canal que llega en un lote posterior no tendría forma de encontrar la
+# categoría que ya se recreó en un lote anterior del MISMO nuke (su id de
+# categoría original ya no existe en ningún lado) y se recrearía suelto.
+_categorias_recreadas: dict[int, dict[int, discord.CategoryChannel]] = defaultdict(dict)
+
+
+def _resolver_categoria_destino(guild: discord.Guild, cat_id_original, mapa_categorias: dict):
+    """Decide a qué categoría debe ir un canal que se está restaurando o
+    re-parentando, probando en orden:
+      1) si su categoría fue recreada en ESTE mismo lote
+      2) si su categoría original sigue existiendo tal cual (nunca se borró)
+      3) si su categoría ya se recreó en un lote anterior del mismo nuke
+    Si no encuentra nada fiable devuelve None; quien llama NO debe forzar el
+    canal a "sin categoría" en ese caso, sólo dejarlo como está.
+    """
+    if cat_id_original is None:
+        return None
+    if cat_id_original in mapa_categorias:
+        return mapa_categorias[cat_id_original]
+    existente = guild.get_channel(cat_id_original)
+    if isinstance(existente, discord.CategoryChannel):
+        return existente
+    recreada = _categorias_recreadas[guild.id].get(cat_id_original)
+    if recreada is not None:
+        actual = guild.get_channel(recreada.id)
+        if isinstance(actual, discord.CategoryChannel):
+            return actual
+        _categorias_recreadas[guild.id].pop(cat_id_original, None)  # ya no existe, descartar
+    return None
 
 
 async def _procesar_restauracion(guild_id: int):
-    """Espera hasta que no lleguen más borrados (agrupa un nuke completo) y
-    luego restaura categorías + canales en un solo paso coordinado."""
+    """Espera hasta que no lleguen más borrados/cambios (agrupa un nuke
+    completo) y luego restaura categorías, recrea canales borrados y
+    re-parenta canales que quedaron huérfanos (perdieron su categoría sin
+    ser borrados), todo en un solo paso coordinado."""
     try:
         while True:
             await asyncio.sleep(DEBOUNCE_RESTORE)
@@ -367,15 +403,26 @@ async def _procesar_restauracion(guild_id: int):
         vistos = set()
         categorias_borradas = []
         canales_borrados = []
+        canales_reparentar = []
         for item in lote:
             canal = item['channel']
-            if canal.id in vistos:
+            tipo = item.get('tipo', 'delete')
+            clave = (canal.id, tipo)
+            if clave in vistos:
                 continue
-            vistos.add(canal.id)
-            if isinstance(canal, discord.CategoryChannel):
+            vistos.add(clave)
+            if tipo == 'reparent':
+                canales_reparentar.append(item)
+            elif isinstance(canal, discord.CategoryChannel):
                 categorias_borradas.append(item)
             else:
                 canales_borrados.append(item)
+
+        # si un canal quedó huérfano y ADEMÁS fue borrado de verdad dentro
+        # del mismo lote, el borrado manda: se recrea desde cero más abajo,
+        # así que re-parentar el objeto viejo por separado sería redundante
+        ids_borrados = {item['channel'].id for item in canales_borrados}
+        canales_reparentar = [it for it in canales_reparentar if it['channel'].id not in ids_borrados]
 
         # 1) recrear categorías borradas primero, guardando id_viejo → nueva
         mapa_categorias: dict[int, discord.CategoryChannel] = {}
@@ -391,23 +438,18 @@ async def _procesar_restauracion(guild_id: int):
                 except Exception:
                     pass
                 mapa_categorias[cat.id] = nueva_cat
+                _categorias_recreadas[guild_id][cat.id] = nueva_cat
             except Exception as e:
                 log.error(f'[AntiNuke] No pude restaurar categoría {cat.name}: {e}')
 
-        # 2) recrear canales, re-parentando a la categoría nueva (si la suya
-        #    también fue borrada en este lote) o a la existente si sigue en pie
+        # 2) recrear canales borrados, re-parentando a la categoría nueva (si
+        #    la suya también fue borrada en este lote o en uno anterior del
+        #    mismo nuke) o a la existente si sigue en pie
         for item in sorted(canales_borrados, key=lambda x: x['channel'].position):
             canal, autor = item['channel'], item['autor']
             cat_id_original = item.get('category_id')
             try:
-                categoria_destino = None
-                if cat_id_original is not None:
-                    if cat_id_original in mapa_categorias:
-                        categoria_destino = mapa_categorias[cat_id_original]
-                    else:
-                        existente = guild.get_channel(cat_id_original)
-                        if isinstance(existente, discord.CategoryChannel):
-                            categoria_destino = existente
+                categoria_destino = _resolver_categoria_destino(guild, cat_id_original, mapa_categorias)
 
                 overwrites = canal.overwrites
                 if isinstance(canal, discord.TextChannel):
@@ -437,13 +479,41 @@ async def _procesar_restauracion(guild_id: int):
             except Exception as e:
                 log.error(f'[AntiNuke] No pude restaurar canal {canal.name}: {e}')
 
-        total = len(categorias_borradas) + len(canales_borrados)
+        # 3) re-parentar canales que sólo quedaron huérfanos (siguen vivos,
+        #    sólo perdieron su categoría porque ésta se borró). Antes esto lo
+        #    resolvía on_guild_channel_update al vuelo con `before.category`,
+        #    una propiedad que busca en la caché EN VIVO: si la categoría
+        #    también había sido borrada por el mismo nuke (el caso típico),
+        #    devolvía None y el canal se quedaba fuera de categoría para
+        #    siempre. Ahora se resuelve aquí con el mismo mapeo que ya
+        #    recreó las categorías arriba.
+        for item in canales_reparentar:
+            canal, autor = item['channel'], item['autor']
+            cat_id_original = item.get('category_id')
+            categoria_destino = _resolver_categoria_destino(guild, cat_id_original, mapa_categorias)
+            if categoria_destino is None:
+                # no hay forma fiable de saber a dónde iba: se deja el canal
+                # tal cual en vez de forzarlo a "sin categoría"
+                continue
+            try:
+                edit_kwargs = {
+                    'category': categoria_destino,
+                    'reason': f'[AntiNuke] Canal devuelto a su categoría original por {autor}',
+                }
+                if item.get('posicion') is not None:
+                    edit_kwargs['position'] = item['posicion']
+                await canal.edit(**edit_kwargs)
+            except Exception as e:
+                log.error(f'[AntiNuke] No pude re-parentar canal {canal.name}: {e}')
+
+        total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar)
         if total:
             autor_principal = lote[0]['autor']
             await log_antinuke(
                 guild, '♻️ Estructura Restaurada',
                 f'**Categorías restauradas:** {len(categorias_borradas)}\n'
-                f'**Canales restaurados:** {len(canales_borrados)}\n'
+                f'**Canales recreados:** {len(canales_borrados)}\n'
+                f'**Canales re-parentados:** {len(canales_reparentar)}\n'
                 f'**Detectado por acción de:** {autor_principal.mention}',
                 0x00FF88,
             )
@@ -453,11 +523,12 @@ async def _procesar_restauracion(guild_id: int):
         _restore_tasks.pop(guild_id, None)
 
 
-def _encolar_restauracion(channel, autor, category_id):
+def _encolar_restauracion(channel, autor, category_id, tipo='delete', posicion=None):
     guild_id = channel.guild.id
     _last_delete_time[guild_id] = time.time()
     _pending_channel_deletes[guild_id].append({
         'channel': channel, 'autor': autor, 'category_id': category_id,
+        'tipo': tipo, 'posicion': posicion,
     })
     tarea = _restore_tasks.get(guild_id)
     if tarea is None or tarea.done():
@@ -811,6 +882,20 @@ async def on_guild_channel_update(before, after):
     if not cfg.get('activo'):
         return
 
+    # IMPORTANTE: igual que en on_guild_channel_delete, se guarda el id de
+    # categoría original AHORA, de forma síncrona. Antes, más abajo, se usaba
+    # `before.category` (propiedad "en vivo" que busca en la caché del
+    # guild) para devolver el canal a su sitio. El problema: cuando un nuke
+    # borra una categoría, sus canales quedan "huérfanos" (parent_id a null)
+    # y eso es justo lo que dispara este evento — así que, para cuando este
+    # handler llegaba a usar `before.category` (después del sleep y del
+    # fetch de audit logs), la categoría original solía estar YA borrada de
+    # la caché, `before.category` devolvía None, y el canal se movía a "sin
+    # categoría" en vez de recuperarse. `category_id` no depende de la
+    # caché y sigue siendo válido aunque la categoría ya no exista.
+    category_id_original = before.category_id
+    posicion_original = before.position
+
     await asyncio.sleep(0.5)
     try:
         entries = [e async for e in before.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update)]
@@ -822,19 +907,13 @@ async def on_guild_channel_update(before, after):
 
         count = registrar_accion(autor.id, 'canales', before.guild.id)
 
-        try:
-            await after.edit(
-                category=before.category, position=before.position,
-                reason=f'[AntiNuke] Canal devuelto a su categoría original por {autor}',
-            )
-            cat_nombre = before.category.name if before.category else 'sin categoría'
-            await log_antinuke(
-                before.guild, '📁 Canal Devuelto a su Categoría',
-                f'**Canal:** {after.mention}\n**Categoría original:** `{cat_nombre}`\n**Movido por:** {autor.mention}',
-                0x00FF88,
-            )
-        except Exception as e:
-            log.error(f'[AntiNuke] No pude devolver el canal {after.name} a su categoría: {e}')
+        # en vez de editar el canal aquí mismo (ver comentario arriba), se
+        # encola junto con el resto del lote de restauración del servidor:
+        # si la categoría fue borrada en el mismo nuke, se recrea primero
+        # (o se reutiliza la que ya se recreó momentos antes) y este canal
+        # se re-parenta a ella de forma coordinada — nunca se le fuerza
+        # "sin categoría" salvo que de verdad no haya nada a lo que volver
+        _encolar_restauracion(after, autor, category_id_original, tipo='reparent', posicion=posicion_original)
 
         if count >= cfg['limites']['canales']:
             m = await _obtener_miembro(before.guild, autor.id)
