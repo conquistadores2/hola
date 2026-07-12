@@ -312,7 +312,27 @@ def _snapshot_guild(guild: discord.Guild) -> dict:
 @tasks.loop(minutes=1)
 async def snapshot_loop():
     snaps = cargar_snapshots()
+    pospuestos = 0
     for guild in bot.guilds:
+        # FIX (bug nuevo, el de los canales "014, 012, 010..." sueltos):
+        # si hay una restauración de nuke en curso para este server, NO
+        # pisar el snapshot bueno (pre-nuke) con el estado actual — que en
+        # este momento puede estar a medio recrear, o directamente en el
+        # punto más "nukeado" posible. `_restaurar_desde_snapshot` (paso 4
+        # de _procesar_restauracion, y también `,an_restore`) depende de
+        # que server_snapshot.json siempre refleje el último estado SANO
+        # conocido. Si este loop de 1 min cae justo en medio de un nuke real
+        # (muy probable: un nuke tarda segundos, la restauración con
+        # rate-limit de por medio puede tardar más de un minuto), se
+        # guardaría el estado roto encima del bueno y la red de seguridad
+        # se queda sin nada confiable con qué reconstruir — los canales que
+        # el tracking en vivo no haya alcanzado a reparentar se pierden para
+        # siempre. Se pospone hasta el próximo ciclo; no pasa nada por
+        # esperar, de todas formas corre cada 1 min.
+        tarea = _restore_tasks.get(guild.id)
+        if tarea is not None and not tarea.done():
+            pospuestos += 1
+            continue
         snaps[str(guild.id)] = _snapshot_guild(guild)
         # FIX: refresco redundante de _ultima_categoria_conocida cada minuto,
         # además del que ya hace on_guild_channel_update en vivo. Cubre el
@@ -323,7 +343,8 @@ async def snapshot_loop():
             if cat_id is not None:
                 _ultima_categoria_conocida[canal.id] = cat_id
     guardar_snapshots(snaps)
-    log.info(f'[Snapshot] Guardados {len(bot.guilds)} servidores.')
+    log.info(f'[Snapshot] Guardados {len(bot.guilds) - pospuestos} servidor(es)'
+             + (f' ({pospuestos} pospuesto(s) por restauración en curso)' if pospuestos else '') + '.')
 
 
 @snapshot_loop.before_loop
@@ -412,6 +433,15 @@ def _resolver_categoria_destino(guild: discord.Guild, cat_id_original, mapa_cate
     return None
 
 
+def _autor_desc(autor) -> str:
+    """Descripción legible del autor para reasons/logs de restauración.
+    `autor` puede ser None: ver el FIX en on_guild_channel_delete/update —
+    ahora la restauración se encola SIEMPRE, incluso cuando el audit log no
+    respondió a tiempo y no se pudo identificar quién hizo el borrado/move.
+    En ese caso sólo se pierde esta descripción, nunca la recuperación."""
+    return str(autor) if autor is not None else 'autor desconocido (audit log no disponible)'
+
+
 # ─── Helpers de restauración en paralelo ─────────────────────────────────────
 # Antes cada categoría/canal se creaba con un await secuencial, uno detrás de
 # otro, así que un nuke de 20 canales tardaba en restaurarse ~20 veces lo que
@@ -424,7 +454,7 @@ async def _crear_categoria_borrada(guild: discord.Guild, item: dict):
     try:
         nueva_cat = await guild.create_category(
             name=cat.name, overwrites=cat.overwrites,
-            reason=f'[AntiNuke] Restaurando categoría por {autor}',
+            reason=f'[AntiNuke] Restaurando categoría por {_autor_desc(autor)}',
         )
         try:
             await nueva_cat.edit(position=cat.position)
@@ -447,20 +477,20 @@ async def _crear_canal_borrado(guild: discord.Guild, item: dict, mapa_categorias
                 name=canal.name, topic=canal.topic,
                 slowmode_delay=canal.slowmode_delay, nsfw=canal.nsfw,
                 overwrites=overwrites, category=categoria_destino,
-                reason=f'[AntiNuke] Restaurando canal por {autor}',
+                reason=f'[AntiNuke] Restaurando canal por {_autor_desc(autor)}',
             )
         elif isinstance(canal, discord.VoiceChannel):
             nuevo = await guild.create_voice_channel(
                 name=canal.name, bitrate=canal.bitrate,
                 user_limit=canal.user_limit, overwrites=overwrites,
                 category=categoria_destino,
-                reason=f'[AntiNuke] Restaurando canal por {autor}',
+                reason=f'[AntiNuke] Restaurando canal por {_autor_desc(autor)}',
             )
         else:
             nuevo = await guild.create_text_channel(
                 name=canal.name, overwrites=overwrites,
                 category=categoria_destino,
-                reason=f'[AntiNuke] Restaurando canal por {autor}',
+                reason=f'[AntiNuke] Restaurando canal por {_autor_desc(autor)}',
             )
         try:
             await nuevo.edit(position=canal.position)
@@ -489,7 +519,7 @@ async def _reparentar_canal_huerfano(guild: discord.Guild, item: dict, mapa_cate
     try:
         edit_kwargs = {
             'category': categoria_destino,
-            'reason': f'[AntiNuke] Canal devuelto a su categoría original por {autor}',
+            'reason': f'[AntiNuke] Canal devuelto a su categoría original por {_autor_desc(autor)}',
         }
         if item.get('posicion') is not None:
             edit_kwargs['position'] = item['posicion']
@@ -611,13 +641,14 @@ async def _procesar_restauracion(guild_id: int):
             total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar) + extra
             if total:
                 autor_principal = lote[0]['autor']
+                autor_desc = autor_principal.mention if autor_principal is not None else _autor_desc(None)
                 await log_antinuke(
                     guild, '♻️ Estructura Restaurada',
                     f'**Categorías restauradas:** {len(categorias_borradas)}\n'
                     f'**Canales recreados:** {len(canales_borrados)}\n'
                     f'**Canales re-parentados:** {len(canales_reparentar)}\n'
                     f'**Recuperados extra del snapshot:** {extra}\n'
-                    f'**Detectado por acción de:** {autor_principal.mention}',
+                    f'**Detectado por acción de:** {autor_desc}',
                     0x00FF88,
                 )
             # OJO: no se retorna aquí. Se vuelve al principio del while
@@ -924,30 +955,52 @@ async def on_guild_channel_delete(channel):
     # tiempo (en on_guild_channel_update, antes de que se perdiera).
     if category_id_original is None:
         category_id_original = _ultima_categoria_conocida.get(channel.id)
+
     await asyncio.sleep(0.5)
+
+    # FIX (la causa real de los canales "014, 012..." que quedan sueltos):
+    # identificar al autor y restaurar el canal son dos cosas separadas.
+    # Antes, si esta consulta al audit log llegaba vacía —o discord.py la
+    # tiraba por rate-limit, algo típico bajo un nuke real, donde decenas de
+    # canales disparan esta MISMA consulta 0.5s después de sus respectivos
+    # borrados, todas casi juntas— el `return` de más abajo cortaba TODO el
+    # handler antes de llegar a `_encolar_restauracion`. Ese canal se perdía
+    # para siempre: nadie más lo iba a encolar (salvo, con suerte, que OTRO
+    # canal del mismo lote sí identificara autor y por eso se disparara la
+    # reconciliación por snapshot del paso 4 — pero si el snapshot bueno
+    # también se había perdido, o si NINGÚN canal del nuke lograba pasar el
+    # audit log a tiempo, no quedaba ninguna red de seguridad). Ahora la
+    # falta de autor sólo le cuesta la atribución (logs / conteo para el
+    # límite / castigo); la restauración se encola SIEMPRE que el antinuke
+    # esté activo, haya o no autor identificado.
+    autor = None
     try:
         entries = [e async for e in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_delete)]
-        if not entries:
-            return
-        autor = entries[0].user
-        if autor.id == bot.user.id or es_seguro(autor.id, channel.guild):
-            return
-        count = registrar_accion(autor.id, 'canales', channel.guild.id)
+        if entries:
+            autor = entries[0].user
+    except Exception as e:
+        log.error(f'[AntiNuke] on_guild_channel_delete (audit log): {e}')
 
+    if autor is not None and (autor.id == bot.user.id or es_seguro(autor.id, channel.guild)):
+        return
+
+    try:
         # en vez de restaurar este canal aislado, se encola junto con el
         # resto de borrados simultáneos del mismo servidor: así, si un nuke
         # borró la categoría y sus canales juntos, se recrea la categoría
         # primero y luego los canales quedan bien re-parentados dentro de ella
         _encolar_restauracion(channel, autor, category_id_original)
 
-        if count >= cfg['limites']['canales']:
-            m = await _obtener_miembro(channel.guild, autor.id)
-            if autor.bot:
-                await ejecutar_castigo_bot(channel.guild, autor, f'Borrado masivo de canales ({count})')
-            elif m:
-                await ejecutar_castigo(channel.guild, m, f'Borrado masivo de canales ({count})')
-                await log_antinuke(channel.guild, '🗑️ Borrado Masivo de Canales',
-                                   f'**Por:** {autor.mention}\n**Canales:** {count}')
+        if autor is not None:
+            count = registrar_accion(autor.id, 'canales', channel.guild.id)
+            if count >= cfg['limites']['canales']:
+                m = await _obtener_miembro(channel.guild, autor.id)
+                if autor.bot:
+                    await ejecutar_castigo_bot(channel.guild, autor, f'Borrado masivo de canales ({count})')
+                elif m:
+                    await ejecutar_castigo(channel.guild, m, f'Borrado masivo de canales ({count})')
+                    await log_antinuke(channel.guild, '🗑️ Borrado Masivo de Canales',
+                                       f'**Por:** {autor.mention}\n**Canales:** {count}')
     except Exception as e:
         log.error(f'[AntiNuke] on_guild_channel_delete: {e}')
 
@@ -1024,16 +1077,23 @@ async def on_guild_channel_update(before, after):
     posicion_original = before.position
 
     await asyncio.sleep(0.5)
+
+    # FIX: mismo razonamiento que en on_guild_channel_delete — el autor y el
+    # re-parentado son independientes. Si el audit log no responde a tiempo,
+    # el canal se encola igual para que se procese en el paso 1-3 (o, como
+    # red de seguridad, en el paso 4 contra el snapshot).
+    autor = None
     try:
         entries = [e async for e in before.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update)]
-        if not entries:
-            return
-        autor = entries[0].user
-        if autor.id == bot.user.id or es_seguro(autor.id, before.guild):
-            return
+        if entries:
+            autor = entries[0].user
+    except Exception as e:
+        log.error(f'[AntiNuke] on_guild_channel_update (audit log): {e}')
 
-        count = registrar_accion(autor.id, 'canales', before.guild.id)
+    if autor is not None and (autor.id == bot.user.id or es_seguro(autor.id, before.guild)):
+        return
 
+    try:
         # en vez de editar el canal aquí mismo (ver comentario arriba), se
         # encola junto con el resto del lote de restauración del servidor:
         # si la categoría fue borrada en el mismo nuke, se recrea primero
@@ -1042,14 +1102,16 @@ async def on_guild_channel_update(before, after):
         # "sin categoría" salvo que de verdad no haya nada a lo que volver
         _encolar_restauracion(after, autor, category_id_original, tipo='reparent', posicion=posicion_original)
 
-        if count >= cfg['limites']['canales']:
-            m = await _obtener_miembro(before.guild, autor.id)
-            if autor.bot:
-                await ejecutar_castigo_bot(before.guild, autor, f'Movimiento masivo de canales ({count})')
-            elif m:
-                await ejecutar_castigo(before.guild, m, f'Movimiento masivo de canales ({count})')
-                await log_antinuke(before.guild, '🛑 Movimiento Masivo de Canales',
-                                   f'**Por:** {autor.mention}\n**Canales movidos:** {count}\n**Acción:** `{cfg["accion"]}`')
+        if autor is not None:
+            count = registrar_accion(autor.id, 'canales', before.guild.id)
+            if count >= cfg['limites']['canales']:
+                m = await _obtener_miembro(before.guild, autor.id)
+                if autor.bot:
+                    await ejecutar_castigo_bot(before.guild, autor, f'Movimiento masivo de canales ({count})')
+                elif m:
+                    await ejecutar_castigo(before.guild, m, f'Movimiento masivo de canales ({count})')
+                    await log_antinuke(before.guild, '🛑 Movimiento Masivo de Canales',
+                                       f'**Por:** {autor.mention}\n**Canales movidos:** {count}\n**Acción:** `{cfg["accion"]}`')
     except Exception as e:
         log.error(f'[AntiNuke] on_guild_channel_update: {e}')
 
