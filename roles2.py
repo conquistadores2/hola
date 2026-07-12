@@ -504,96 +504,129 @@ async def _procesar_restauracion(guild_id: int):
     re-parenta canales que quedaron huérfanos (perdieron su categoría sin
     ser borrados), todo en un solo paso coordinado. Dentro de cada paso,
     las creaciones/ediciones se lanzan en paralelo con asyncio.gather en
-    vez de una por una, para que la restauración sea más rápida."""
+    vez de una por una, para que la restauración sea más rápida.
+
+    FIX — canales que sobreviven a un nuke parcial y quedaban huérfanos
+    para siempre: antes esta función procesaba UN solo lote y terminaba.
+    El problema: los pasos de abajo (crear categorías/canales por la API
+    de Discord, más TODA la reconciliación contra el snapshot completo del
+    paso 4) pueden tardar varios segundos — y `_encolar_restauracion` sólo
+    lanza una tarea nueva `if tarea is None or tarea.done()`. Si el nuke
+    seguía en marcha mientras este lote se restauraba (típico cuando el
+    nuke NO logra borrar todos los canales de una vez: el script sigue
+    disparando borrados mientras el bot ya está ocupado recreando/
+    reparentando los anteriores), los nuevos `on_guild_channel_delete` /
+    `on_guild_channel_update` SÍ metían sus ítems en
+    `_pending_channel_deletes` (vía `_encolar_restauracion`), pero NO
+    creaban una tarea nueva, porque la de este mismo run seguía "viva"
+    (`tarea.done()` daba False). Al terminar, el `finally` se
+    desregistraba de `_restore_tasks` sin volver a revisar si habían
+    llegado ítems nuevos, así que esos canales — justo los que el nuke "no
+    alcanzó a borrar" y se quedaron sin categoría — se perdían para
+    siempre: nadie los iba a procesar salvo que, por pura casualidad,
+    llegara después otro evento de canal no relacionado que reactivara la
+    cola. Ahora el `while True` externo no termina la tarea tras un solo
+    lote: vuelve a esperar silencio y repite hasta que de verdad no quede
+    nada pendiente en `_pending_channel_deletes` para este guild."""
     try:
         while True:
-            await asyncio.sleep(DEBOUNCE_RESTORE)
-            ultimo = _last_delete_time.get(guild_id, 0)
-            if time.time() - ultimo >= DEBOUNCE_RESTORE:
-                break
+            while True:
+                await asyncio.sleep(DEBOUNCE_RESTORE)
+                ultimo = _last_delete_time.get(guild_id, 0)
+                if time.time() - ultimo >= DEBOUNCE_RESTORE:
+                    break
 
-        lote = _pending_channel_deletes.pop(guild_id, [])
-        _last_delete_time.pop(guild_id, None)
-        if not lote:
-            return
+            lote = _pending_channel_deletes.pop(guild_id, [])
+            _last_delete_time.pop(guild_id, None)
+            if not lote:
+                # de verdad no quedó nada pendiente tras el silencio: recién
+                # ahora es seguro terminar la tarea (ver FIX en el docstring)
+                return
 
-        guild = bot.get_guild(guild_id)
-        if guild is None:
-            return
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                return
 
-        vistos = set()
-        categorias_borradas = []
-        canales_borrados = []
-        canales_reparentar = []
-        for item in lote:
-            canal = item['channel']
-            tipo = item.get('tipo', 'delete')
-            clave = (canal.id, tipo)
-            if clave in vistos:
-                continue
-            vistos.add(clave)
-            if tipo == 'reparent':
-                canales_reparentar.append(item)
-            elif isinstance(canal, discord.CategoryChannel):
-                categorias_borradas.append(item)
-            else:
-                canales_borrados.append(item)
+            vistos = set()
+            categorias_borradas = []
+            canales_borrados = []
+            canales_reparentar = []
+            for item in lote:
+                canal = item['channel']
+                tipo = item.get('tipo', 'delete')
+                clave = (canal.id, tipo)
+                if clave in vistos:
+                    continue
+                vistos.add(clave)
+                if tipo == 'reparent':
+                    canales_reparentar.append(item)
+                elif isinstance(canal, discord.CategoryChannel):
+                    categorias_borradas.append(item)
+                else:
+                    canales_borrados.append(item)
 
-        # si un canal quedó huérfano y ADEMÁS fue borrado de verdad dentro
-        # del mismo lote, el borrado manda: se recrea desde cero más abajo,
-        # así que re-parentar el objeto viejo por separado sería redundante
-        ids_borrados = {item['channel'].id for item in canales_borrados}
-        canales_reparentar = [it for it in canales_reparentar if it['channel'].id not in ids_borrados]
+            # si un canal quedó huérfano y ADEMÁS fue borrado de verdad dentro
+            # del mismo lote, el borrado manda: se recrea desde cero más abajo,
+            # así que re-parentar el objeto viejo por separado sería redundante
+            ids_borrados = {item['channel'].id for item in canales_borrados}
+            canales_reparentar = [it for it in canales_reparentar if it['channel'].id not in ids_borrados]
 
-        # 1) recrear categorías borradas primero, guardando id_viejo → nueva.
-        #    Se lanzan todas a la vez con asyncio.gather (antes era un await
-        #    por categoría, uno detrás de otro) porque son independientes
-        #    entre sí; sólo hace falta que TODAS terminen antes de seguir,
-        #    ya que los pasos 2 y 3 necesitan el mapeo completo para saber
-        #    a dónde reparentar cada canal.
-        mapa_categorias: dict[int, discord.CategoryChannel] = {}
-        if categorias_borradas:
-            resultados_cat = await asyncio.gather(
-                *(_crear_categoria_borrada(guild, item) for item in categorias_borradas)
-            )
-            for cat_id_original, nueva_cat in resultados_cat:
-                if nueva_cat is not None:
-                    mapa_categorias[cat_id_original] = nueva_cat
-                    _categorias_recreadas[guild_id][cat_id_original] = nueva_cat
+            # 1) recrear categorías borradas primero, guardando id_viejo → nueva.
+            #    Se lanzan todas a la vez con asyncio.gather (antes era un await
+            #    por categoría, uno detrás de otro) porque son independientes
+            #    entre sí; sólo hace falta que TODAS terminen antes de seguir,
+            #    ya que los pasos 2 y 3 necesitan el mapeo completo para saber
+            #    a dónde reparentar cada canal.
+            mapa_categorias: dict[int, discord.CategoryChannel] = {}
+            if categorias_borradas:
+                resultados_cat = await asyncio.gather(
+                    *(_crear_categoria_borrada(guild, item) for item in categorias_borradas)
+                )
+                for cat_id_original, nueva_cat in resultados_cat:
+                    if nueva_cat is not None:
+                        mapa_categorias[cat_id_original] = nueva_cat
+                        _categorias_recreadas[guild_id][cat_id_original] = nueva_cat
 
-        # 2) recrear canales borrados y 3) re-parentar canales que quedaron
-        #    huérfanos (siguen vivos, sólo perdieron su categoría). Ambos
-        #    pasos sólo dependen de `mapa_categorias` (ya resuelto arriba),
-        #    no entre sí, así que se lanzan juntos y en paralelo en vez de
-        #    uno detrás del otro — esto es lo que más tiempo ahorra cuando
-        #    el nuke afectó muchos canales a la vez.
-        if canales_borrados or canales_reparentar:
-            await asyncio.gather(
-                *(_crear_canal_borrado(guild, item, mapa_categorias) for item in canales_borrados),
-                *(_reparentar_canal_huerfano(guild, item, mapa_categorias) for item in canales_reparentar),
-            )
+            # 2) recrear canales borrados y 3) re-parentar canales que quedaron
+            #    huérfanos (siguen vivos, sólo perdieron su categoría). Ambos
+            #    pasos sólo dependen de `mapa_categorias` (ya resuelto arriba),
+            #    no entre sí, así que se lanzan juntos y en paralelo en vez de
+            #    uno detrás del otro — esto es lo que más tiempo ahorra cuando
+            #    el nuke afectó muchos canales a la vez.
+            if canales_borrados or canales_reparentar:
+                await asyncio.gather(
+                    *(_crear_canal_borrado(guild, item, mapa_categorias) for item in canales_borrados),
+                    *(_reparentar_canal_huerfano(guild, item, mapa_categorias) for item in canales_reparentar),
+                )
 
-        # 4) red de seguridad: reconciliar contra el último snapshot completo
-        #    (categorías + canales de adentro). Esto cubre lo que el rastreo
-        #    en vivo de arriba no pudo resolver — p. ej. si el bot se
-        #    reinició a mitad del nuke (redeploy en Railway) y perdió el
-        #    estado en memoria (_categorias_recreadas, _pending_channel_deletes).
-        #    El dedup por nombre dentro de _restaurar_desde_snapshot evita
-        #    duplicar lo que los pasos 1-3 ya recrearon.
-        extra = await _restaurar_desde_snapshot(guild)
+            # 4) red de seguridad: reconciliar contra el último snapshot completo
+            #    (categorías + canales de adentro). Esto cubre lo que el rastreo
+            #    en vivo de arriba no pudo resolver — p. ej. si el bot se
+            #    reinició a mitad del nuke (redeploy en Railway) y perdió el
+            #    estado en memoria (_categorias_recreadas, _pending_channel_deletes).
+            #    El dedup por nombre dentro de _restaurar_desde_snapshot evita
+            #    duplicar lo que los pasos 1-3 ya recrearon.
+            extra = await _restaurar_desde_snapshot(guild)
 
-        total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar) + extra
-        if total:
-            autor_principal = lote[0]['autor']
-            await log_antinuke(
-                guild, '♻️ Estructura Restaurada',
-                f'**Categorías restauradas:** {len(categorias_borradas)}\n'
-                f'**Canales recreados:** {len(canales_borrados)}\n'
-                f'**Canales re-parentados:** {len(canales_reparentar)}\n'
-                f'**Recuperados extra del snapshot:** {extra}\n'
-                f'**Detectado por acción de:** {autor_principal.mention}',
-                0x00FF88,
-            )
+            total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar) + extra
+            if total:
+                autor_principal = lote[0]['autor']
+                await log_antinuke(
+                    guild, '♻️ Estructura Restaurada',
+                    f'**Categorías restauradas:** {len(categorias_borradas)}\n'
+                    f'**Canales recreados:** {len(canales_borrados)}\n'
+                    f'**Canales re-parentados:** {len(canales_reparentar)}\n'
+                    f'**Recuperados extra del snapshot:** {extra}\n'
+                    f'**Detectado por acción de:** {autor_principal.mention}',
+                    0x00FF88,
+                )
+            # OJO: no se retorna aquí. Se vuelve al principio del while
+            # externo para revisar si, mientras se restauraba este lote,
+            # llegaron ítems nuevos a _pending_channel_deletes (nuke que
+            # seguía en marcha). Si los hay, se procesan en otra vuelta de
+            # inmediato; si no, la próxima vuelta espera el silencio, los
+            # encuentra vacíos y ahí sí termina la tarea (el `return` de
+            # más arriba).
     except Exception as e:
         log.error(f'[AntiNuke] _procesar_restauracion: {e}')
     finally:
