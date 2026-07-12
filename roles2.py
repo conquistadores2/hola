@@ -682,6 +682,59 @@ async def on_guild_channel_create(channel):
 
 
 @bot.event
+async def on_guild_channel_update(before, after):
+    """
+    Si un canal es movido fuera de su categoría (o a otra distinta de la
+    original), lo regresa automáticamente a su categoría y posición.
+    Así los canales siempre quedan dentro de la categoría que les corresponde.
+    """
+    if isinstance(before, discord.CategoryChannel):
+        return
+    if before.category_id == after.category_id:
+        return
+
+    cfg = cargar_antinuke(before.guild.id)
+    if not cfg.get('activo'):
+        return
+
+    await asyncio.sleep(0.5)
+    try:
+        entries = [e async for e in before.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_update)]
+        if not entries:
+            return
+        autor = entries[0].user
+        if autor.id == bot.user.id or es_seguro(autor.id, before.guild):
+            return
+
+        count = registrar_accion(autor.id, 'canales', before.guild.id)
+
+        try:
+            await after.edit(
+                category=before.category, position=before.position,
+                reason=f'[AntiNuke] Canal devuelto a su categoría original por {autor}',
+            )
+            cat_nombre = before.category.name if before.category else 'sin categoría'
+            await log_antinuke(
+                before.guild, '📁 Canal Devuelto a su Categoría',
+                f'**Canal:** {after.mention}\n**Categoría original:** `{cat_nombre}`\n**Movido por:** {autor.mention}',
+                0x00FF88,
+            )
+        except Exception as e:
+            log.error(f'[AntiNuke] No pude devolver el canal {after.name} a su categoría: {e}')
+
+        if count >= cfg['limites']['canales']:
+            m = await _obtener_miembro(before.guild, autor.id)
+            if autor.bot:
+                await ejecutar_castigo_bot(before.guild, autor, f'Movimiento masivo de canales ({count})')
+            elif m:
+                await ejecutar_castigo(before.guild, m, f'Movimiento masivo de canales ({count})')
+                await log_antinuke(before.guild, '🛑 Movimiento Masivo de Canales',
+                                   f'**Por:** {autor.mention}\n**Canales movidos:** {count}\n**Acción:** `{cfg["accion"]}`')
+    except Exception as e:
+        log.error(f'[AntiNuke] on_guild_channel_update: {e}')
+
+
+@bot.event
 async def on_webhooks_update(channel):
     cfg = cargar_antinuke(channel.guild.id)
     if not cfg.get('activo'):
@@ -4192,7 +4245,8 @@ def _build_ayuda_pages() -> list:
          f'`{p}an_whitelist [@u]` `{p}an_accion` `{p}an_limite` `{p}an_ventana`\n'
          f'`{p}an_antiraid_on/off` `{p}an_antilinks_on/off` `{p}an_antispam_on/off`\n'
          f'`{p}an_antibot_on/off` `{p}an_ver_on/off` `{p}an_snapshot` `{p}an_restore`\n'
-         f'Detecta: bans/kicks/roles/canales masivos · roles peligrosos · escalada de perms · cambio de servidor'),
+         f'Detecta: bans/kicks/roles/canales masivos · roles peligrosos · escalada de perms\n'
+         f'cambio de servidor · canales movidos fuera de su categoría (se regresan solos)'),
         ('🔒', 'Moderación',
          f'`{p}ban` `{p}unban` `{p}kick` `{p}mute` `{p}unmute`\n'
          f'`{p}softban` `{p}massban` `{p}masskick` `{p}banlist`\n'
