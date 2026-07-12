@@ -314,6 +314,14 @@ async def snapshot_loop():
     snaps = cargar_snapshots()
     for guild in bot.guilds:
         snaps[str(guild.id)] = _snapshot_guild(guild)
+        # FIX: refresco redundante de _ultima_categoria_conocida cada minuto,
+        # además del que ya hace on_guild_channel_update en vivo. Cubre el
+        # caso de un canal que nunca disparó un evento de update desde que
+        # arrancó el bot (por eso el mapa aún no tenía su categoría guardada).
+        for canal in guild.channels:
+            cat_id = getattr(canal, 'category_id', None)
+            if cat_id is not None:
+                _ultima_categoria_conocida[canal.id] = cat_id
     guardar_snapshots(snaps)
     log.info(f'[Snapshot] Guardados {len(bot.guilds)} servidores.')
 
@@ -352,6 +360,31 @@ _restore_tasks: dict[int, asyncio.Task] = {}
 # categoría que ya se recreó en un lote anterior del MISMO nuke (su id de
 # categoría original ya no existe en ningún lado) y se recrearía suelto.
 _categorias_recreadas: dict[int, dict[int, discord.CategoryChannel]] = defaultdict(dict)
+
+# ─── FIX: última categoría NO NULA conocida de cada canal ───────────────────
+# channel_id -> category_id
+#
+# Este es el motivo real de que los canales terminen sueltos, fuera de sus
+# categorías, después de un nuke: discord.py NO crea un objeto Python nuevo
+# por cada evento de canal — reutiliza y MUTA el mismo objeto en caché
+# (ver TextChannel._update / VocalGuildChannel._update: hacen
+# `self.category_id = ...`). Cuando un nuke borra primero una categoría,
+# discord.py recibe un CHANNEL_UPDATE por cada canal hijo (parent_id -> null)
+# y aplica ese cambio mutando el ÚNICO objeto cacheado de cada canal. Si
+# instantes después ese mismo canal es borrado también (lo normal: el script
+# que nukea borra la categoría Y luego, aparte, cada canal de adentro), el
+# evento CHANNEL_DELETE que dispara on_guild_channel_delete entrega ESE MISMO
+# objeto, ya mutado: `channel.category_id` llega en None aunque el canal sí
+# tenía categoría un segundo antes. Por eso capturar `category_id` "de forma
+# síncrona" en on_guild_channel_delete no alcanza — el dato ya venía roto
+# desde discord.py, antes de que el handler del bot corriera.
+#
+# Este mapa guarda la última categoría válida vista para cada canal,
+# alimentado por on_guild_channel_update (que sí recibe un "before" copiado
+# ANTES de la mutación, así que antes.category_id siempre es confiable) y
+# por el snapshot periódico. Sirve de red de recuperación para cuando
+# on_guild_channel_delete recibe category_id=None y no puede confiar en él.
+_ultima_categoria_conocida: dict[int, int] = {}
 
 
 def _resolver_categoria_destino(guild: discord.Guild, cat_id_original, mapa_categorias: dict):
@@ -815,6 +848,15 @@ async def on_guild_channel_delete(channel):
     # fuera de cualquier categoría. `category_id` en cambio queda grabado en
     # el propio objeto del canal y no depende de la caché.
     category_id_original = getattr(channel, 'category_id', None)
+    # FIX: si la categoría de este canal fue borrada ANTES que el canal
+    # mismo (lo más común en un nuke), discord.py ya mutó este objeto
+    # cacheado con category_id=None mediante un CHANNEL_UPDATE previo — ver
+    # el comentario junto a `_ultima_categoria_conocida` más arriba. En ese
+    # caso, `channel.category_id` NO es confiable aunque se lea de forma
+    # síncrona aquí; se recurre al último valor válido que sí se guardó a
+    # tiempo (en on_guild_channel_update, antes de que se perdiera).
+    if category_id_original is None:
+        category_id_original = _ultima_categoria_conocida.get(channel.id)
     await asyncio.sleep(0.5)
     try:
         entries = [e async for e in channel.guild.audit_logs(limit=5, action=discord.AuditLogAction.channel_delete)]
@@ -887,6 +929,14 @@ async def on_guild_channel_update(before, after):
         return
     if before.category_id == after.category_id:
         return
+
+    # FIX: esto se guarda SIEMPRE, aunque el antinuke esté desactivado, para
+    # que _ultima_categoria_conocida esté al día para cuando haga falta.
+    # `before` es una copia tomada ANTES de aplicar este cambio (ver
+    # ConnectionState.parse_channel_update), así que before.category_id es
+    # el último valor real y confiable, justo antes de perderse.
+    if before.category_id is not None:
+        _ultima_categoria_conocida[before.id] = before.category_id
 
     cfg = cargar_antinuke(before.guild.id)
     if not cfg.get('activo'):
@@ -4732,6 +4782,14 @@ async def on_ready():
     snaps = cargar_snapshots()
     for guild in bot.guilds:
         snaps[str(guild.id)] = _snapshot_guild(guild)
+        # FIX: sembrar _ultima_categoria_conocida con el estado actual de
+        # todos los canales ya existentes, para que el mapa esté listo desde
+        # el primer segundo (no depender únicamente de que ocurra un evento
+        # de update antes del próximo nuke).
+        for canal in guild.channels:
+            cat_id = getattr(canal, 'category_id', None)
+            if cat_id is not None:
+                _ultima_categoria_conocida[canal.id] = cat_id
     guardar_snapshots(snaps)
     log.info(f'Snapshot inicial guardado para {len(bot.guilds)} servidor(es).')
 
