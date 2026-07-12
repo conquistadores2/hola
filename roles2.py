@@ -506,7 +506,16 @@ async def _procesar_restauracion(guild_id: int):
             except Exception as e:
                 log.error(f'[AntiNuke] No pude re-parentar canal {canal.name}: {e}')
 
-        total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar)
+        # 4) red de seguridad: reconciliar contra el último snapshot completo
+        #    (categorías + canales de adentro). Esto cubre lo que el rastreo
+        #    en vivo de arriba no pudo resolver — p. ej. si el bot se
+        #    reinició a mitad del nuke (redeploy en Railway) y perdió el
+        #    estado en memoria (_categorias_recreadas, _pending_channel_deletes).
+        #    El dedup por nombre dentro de _restaurar_desde_snapshot evita
+        #    duplicar lo que los pasos 1-3 ya recrearon.
+        extra = await _restaurar_desde_snapshot(guild)
+
+        total = len(categorias_borradas) + len(canales_borrados) + len(canales_reparentar) + extra
         if total:
             autor_principal = lote[0]['autor']
             await log_antinuke(
@@ -514,6 +523,7 @@ async def _procesar_restauracion(guild_id: int):
                 f'**Categorías restauradas:** {len(categorias_borradas)}\n'
                 f'**Canales recreados:** {len(canales_borrados)}\n'
                 f'**Canales re-parentados:** {len(canales_reparentar)}\n'
+                f'**Recuperados extra del snapshot:** {extra}\n'
                 f'**Detectado por acción de:** {autor_principal.mention}',
                 0x00FF88,
             )
@@ -1496,29 +1506,48 @@ async def _crear_canal_snapshot(guild: discord.Guild, chdata: dict, categoria=No
     )
 
 
-@bot.command(name='an_restore')
-@commands.check(es_owner_an)
-async def an_restore(ctx):
+def _existe_categoria_por_nombre(guild: discord.Guild, nombre: str):
+    return discord.utils.get(guild.categories, name=nombre)
+
+
+def _existe_canal_por_nombre(guild: discord.Guild, nombre: str, categoria):
+    canales = categoria.channels if categoria else [
+        c for c in guild.channels
+        if c.category is None and not isinstance(c, discord.CategoryChannel)
+    ]
+    return discord.utils.get(canales, name=nombre)
+
+
+async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
+    """Reconstruye categorías y sus canales a partir del último snapshot
+    guardado (server_snapshot.json). Misma lógica que usaba ,an_restore,
+    ahora reutilizable para que el antinuke la dispare SOLA apenas detecta
+    un nuke, sin depender de que un admin corra el comando a mano.
+
+    Dedup: además de comprobar si el ID original sigue vivo, comprueba por
+    NOMBRE. Así, si la restauración en vivo (evento por evento, en
+    _procesar_restauracion) ya recreó una categoría/canal con un ID nuevo,
+    esta función no la vuelve a duplicar.
+    """
     snaps = cargar_snapshots()
-    gsnap = snaps.get(str(ctx.guild.id))
+    gsnap = snaps.get(str(guild.id))
     if not gsnap:
-        return await ctx.send('❌ Sin snapshot. Espera al próximo ciclo de 1 min.')
-    msg = await ctx.send('⏳ Restaurando estructura de canales desde snapshot...')
+        return 0
     restaurados = 0
 
-    # 1) categorías: si sigue existiendo se reutiliza tal cual, si no, se
-    #    recrea y se guarda el mapeo id_viejo → categoría (para el paso 2)
+    # 1) categorías: se reutiliza la existente (por id o por nombre) o se
+    #    recrea, guardando el mapeo id_viejo → categoría para el paso 2
     mapa_categorias: dict[str, discord.CategoryChannel] = {}
     categorias_ordenadas = sorted(
         gsnap['categories'].items(), key=lambda kv: kv[1].get('position', 0)
     )
     for cid, cdata in categorias_ordenadas:
-        existente = ctx.guild.get_channel(int(cid))
+        existente = guild.get_channel(int(cid)) or _existe_categoria_por_nombre(guild, cdata['name'])
         if isinstance(existente, discord.CategoryChannel):
             mapa_categorias[cid] = existente
             continue
         try:
-            nueva = await ctx.guild.create_category(name=cdata['name'], reason='[AntiNuke] Restauración')
+            nueva = await guild.create_category(name=cdata['name'], reason='[AntiNuke] Restauración')
             try:
                 await nueva.edit(position=cdata.get('position', 0))
             except Exception:
@@ -1528,17 +1557,19 @@ async def an_restore(ctx):
         except Exception as e:
             log.error(f'[AntiNuke] No pude restaurar categoría {cdata["name"]}: {e}')
 
-    # 2) canales DENTRO de cada categoría — esto es lo que antes faltaba por
-    #    completo: la función nunca volvía a crear estos canales, así que
-    #    quedaban categorías recreadas pero vacías.
+    # 2) canales DENTRO de cada categoría
     for cid, cdata in gsnap['categories'].items():
         categoria_destino = mapa_categorias.get(cid)
         canales_ordenados = sorted(cdata['channels'], key=lambda c: c.get('position', 0))
         for chdata in canales_ordenados:
-            if ctx.guild.get_channel(int(chdata['id'])):
-                continue  # el canal sigue vivo, no duplicar
+            ya_existe = (
+                guild.get_channel(int(chdata['id']))
+                or _existe_canal_por_nombre(guild, chdata['name'], categoria_destino)
+            )
+            if ya_existe:
+                continue  # ya vivo o ya recreado en vivo, no duplicar
             try:
-                nuevo = await _crear_canal_snapshot(ctx.guild, chdata, categoria_destino)
+                nuevo = await _crear_canal_snapshot(guild, chdata, categoria_destino)
                 try:
                     await nuevo.edit(position=chdata.get('position', 0))
                 except Exception:
@@ -1549,10 +1580,14 @@ async def an_restore(ctx):
 
     # 3) canales que no pertenecían a ninguna categoría
     for cdata in sorted(gsnap['no_category'], key=lambda c: c.get('position', 0)):
-        if ctx.guild.get_channel(int(cdata['id'])):
+        ya_existe = (
+            guild.get_channel(int(cdata['id']))
+            or _existe_canal_por_nombre(guild, cdata['name'], None)
+        )
+        if ya_existe:
             continue
         try:
-            nuevo = await _crear_canal_snapshot(ctx.guild, cdata, None)
+            nuevo = await _crear_canal_snapshot(guild, cdata, None)
             try:
                 await nuevo.edit(position=cdata.get('position', 0))
             except Exception:
@@ -1561,6 +1596,17 @@ async def an_restore(ctx):
         except Exception as e:
             log.error(f'[AntiNuke] No pude restaurar canal {cdata["name"]}: {e}')
 
+    return restaurados
+
+
+@bot.command(name='an_restore')
+@commands.check(es_owner_an)
+async def an_restore(ctx):
+    snaps = cargar_snapshots()
+    if str(ctx.guild.id) not in snaps:
+        return await ctx.send('❌ Sin snapshot. Espera al próximo ciclo de 1 min.')
+    msg = await ctx.send('⏳ Restaurando estructura de canales desde snapshot...')
+    restaurados = await _restaurar_desde_snapshot(ctx.guild)
     await msg.edit(content=f'✅ Restaurados **{restaurados}** canales/categorías desde snapshot (categorías + canales dentro de ellas).')
 
 
@@ -1935,7 +1981,9 @@ async def rename_canal(ctx, *, nombre: str):
 @commands.check(es_admin)
 async def crear_canal(ctx, *, nombre: str):
     nombre = nombre.lower().replace(' ', '-')
-    c = await ctx.guild.create_text_channel(nombre, reason=f'Creado por {ctx.author}')
+    c = await ctx.guild.create_text_channel(
+        nombre, category=ctx.channel.category, reason=f'Creado por {ctx.author}',
+    )
     await ctx.send(f'✅ Canal: {c.mention}')
 
 
