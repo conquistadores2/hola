@@ -450,16 +450,16 @@ def _autor_desc(autor) -> str:
 # asyncio.gather. Cada uno atrapa sus propias excepciones (igual que antes)
 # para que si uno falla no cancele al resto.
 async def _crear_categoria_borrada(guild: discord.Guild, item: dict):
+    """Sólo crea la categoría. La posición se fija después, en un paso
+    secuencial aparte (ver el FIX en _procesar_restauracion, paso 1) para
+    evitar la condición de carrera que desordena las categorías cuando se
+    restauran varias a la vez."""
     cat, autor = item['channel'], item['autor']
     try:
         nueva_cat = await guild.create_category(
             name=cat.name, overwrites=cat.overwrites,
             reason=f'[AntiNuke] Restaurando categoría por {_autor_desc(autor)}',
         )
-        try:
-            await nueva_cat.edit(position=cat.position)
-        except Exception:
-            pass
         return cat.id, nueva_cat
     except Exception as e:
         log.error(f'[AntiNuke] No pude restaurar categoría {cat.name}: {e}')
@@ -616,6 +616,36 @@ async def _procesar_restauracion(guild_id: int):
                     if nueva_cat is not None:
                         mapa_categorias[cat_id_original] = nueva_cat
                         _categorias_recreadas[guild_id][cat_id_original] = nueva_cat
+
+                # FIX (categorías desordenadas): la posición de cada categoría
+                # se fija aparte y UNA POR UNA — nunca con asyncio.gather.
+                # Por dentro, CategoryChannel.edit(position=...) de discord.py
+                # no manda sólo la posición de ESA categoría: relee TODAS las
+                # categorías del servidor desde la caché local, recalcula el
+                # orden completo del servidor y reenvía esa lista entera en un
+                # solo bulk update. Si se lanzan varias ediciones de posición
+                # al mismo tiempo, cada una parte de una caché desactualizada
+                # (todavía no sabe qué posición les acaba de tocar a las
+                # demás, que se están editando en paralelo en ese mismo
+                # instante) y la última en llegar a Discord pisa el orden que
+                # dejaron las anteriores — de ahí que las categorías
+                # terminaran desordenadas al restaurar varias a la vez.
+                # Haciéndolo secuencial y de menor a mayor posición original,
+                # cada .edit() ve ya reflejado el resultado del anterior y el
+                # orden final queda correcto.
+                por_posicion = sorted(
+                    (
+                        (nueva_cat, item['channel'].position)
+                        for item, (_, nueva_cat) in zip(categorias_borradas, resultados_cat)
+                        if nueva_cat is not None
+                    ),
+                    key=lambda t: t[1],
+                )
+                for nueva_cat, posicion_original in por_posicion:
+                    try:
+                        await nueva_cat.edit(position=posicion_original)
+                    except Exception:
+                        pass
 
             # 2) recrear canales borrados y 3) re-parentar canales que quedaron
             #    huérfanos (siguen vivos, sólo perdieron su categoría). Ambos
@@ -1699,12 +1729,11 @@ def _existe_canal_por_nombre(guild: discord.Guild, nombre: str, categoria):
 
 # ─── Helpers de _restaurar_desde_snapshot (creación/reconciliación en paralelo) ──
 async def _crear_categoria_snapshot(guild: discord.Guild, cid: str, cdata: dict):
+    """Sólo crea la categoría. La posición se fija después, en un paso
+    secuencial aparte (ver el FIX en _restaurar_desde_snapshot, paso 1;
+    mismo motivo que en _crear_categoria_borrada)."""
     try:
         nueva = await guild.create_category(name=cdata['name'], reason='[AntiNuke] Restauración')
-        try:
-            await nueva.edit(position=cdata.get('position', 0))
-        except Exception:
-            pass
         return cid, nueva
     except Exception as e:
         log.error(f'[AntiNuke] No pude restaurar categoría {cdata["name"]}: {e}')
@@ -1816,6 +1845,26 @@ async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
             if nueva is not None:
                 mapa_categorias[cid] = nueva
                 restaurados += 1
+
+        # FIX (categorías desordenadas): igual que en _crear_categoria_borrada,
+        # la posición de cada categoría se fija aparte y de a una — nunca en
+        # paralelo — porque CategoryChannel.edit(position=...) recalcula y
+        # reenvía el orden de TODAS las categorías del servidor a la vez a
+        # partir de la caché local; si varias ediciones corren al mismo
+        # tiempo se pisan entre sí y el resultado queda desordenado.
+        por_posicion = sorted(
+            (
+                (nueva, cdata.get('position', 0))
+                for (cid, cdata), (_, nueva) in zip(faltantes_cat, resultados_cat)
+                if nueva is not None
+            ),
+            key=lambda t: t[1],
+        )
+        for nueva, posicion_original in por_posicion:
+            try:
+                await nueva.edit(position=posicion_original)
+            except Exception:
+                pass
 
     # 2) canales dentro de cada categoría + canales sin categoría: se
     #    procesan todos juntos y en paralelo (crear los que faltan,
