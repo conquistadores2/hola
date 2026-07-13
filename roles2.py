@@ -372,6 +372,18 @@ DEBOUNCE_RESTORE = 2.0  # segundos de silencio antes de dar por terminado el lot
 _pending_channel_deletes: dict[int, list] = defaultdict(list)
 _last_delete_time: dict[int, float] = {}
 _restore_tasks: dict[int, asyncio.Task] = {}
+# FIX (categorías/canales duplicados): `_restaurar_desde_snapshot` se podía
+# disparar desde DOS sitios distintos — el paso 4 automático de
+# `_procesar_restauracion` y el comando manual `,an_restore` — sin que
+# ninguno supiera que el otro podía estar corriendo a la vez (p. ej. un
+# admin corre `,an_restore` justo cuando el antinuke ya está restaurando
+# solo, o lo corre dos veces seguidas por impaciencia). Como el chequeo de
+# "¿ya existe esta categoría/canal?" y la creación están separados por un
+# `await`, dos llamadas solapadas veían el mismo hueco vacío antes de que
+# ninguna terminara de llenarlo, y las dos lo llenaban: de ahí las
+# categorías y canales duplicados (mismo nombre, IDs distintos). Este lock
+# por servidor asegura que sólo una reconciliación corra a la vez por guild.
+_snapshot_restore_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 # Mapa PERSISTENTE (a propósito no se limpia al terminar un lote) de
 # categorías ya recreadas por el antinuke: guild_id -> {id_categoría_original: categoría_nueva}.
 # Motivo: un nuke grande (muchos canales) casi siempre se reparte en varios
@@ -508,24 +520,43 @@ async def _reparentar_canal_huerfano(guild: discord.Guild, item: dict, mapa_cate
     categoría también había sido borrada por el mismo nuke (el caso
     típico), devolvía None y el canal se quedaba fuera de categoría para
     siempre. Ahora se resuelve aquí con el mismo mapeo que ya recreó las
-    categorías en el paso 1."""
+    categorías en el paso 1.
+
+    FIX (canales huérfanos muy lentos): aquí SÓLO se cambia `category`,
+    nunca `position` en la misma llamada. Pasar `position` junto con
+    `category` en un mismo `.edit()` hace que discord.py use por dentro
+    el endpoint de reordenamiento MASIVO de canales del servidor
+    (PATCH /guilds/{id}/channels — el mismo que usa CategoryChannel.edit
+    (position=...), ver el FIX de más arriba), que comparte un cupo de
+    rate-limit muy ajustado con TODOS los canales y categorías del
+    servidor a la vez. Con varios canales huérfanos de golpe (lo normal
+    tras un nuke), cada uno peleando por ese mismo cupo compartido, la
+    restauración se vuelve muy lenta aunque se lancen en paralelo con
+    asyncio.gather — discord.py los termina sirviendo casi uno por uno de
+    todas formas porque comparten bucket. Cambiar sólo `category` usa en
+    cambio un PATCH normal a /channels/{id}, con cupo propio POR CANAL que
+    no compite con los demás: el canal vuelve a su categoría casi al
+    instante. La posición exacta dentro de la categoría queda pendiente y
+    se corrige después, aparte y de a una (ver el FIX en
+    _procesar_restauracion, paso 2/3) para no bloquear lo importante
+    (que el canal ya esté en su categoría) con lo secundario (el orden
+    exacto ahí dentro)."""
     canal, autor = item['channel'], item['autor']
     cat_id_original = item.get('category_id')
     categoria_destino = _resolver_categoria_destino(guild, cat_id_original, mapa_categorias)
     if categoria_destino is None:
         # no hay forma fiable de saber a dónde iba: se deja el canal tal
         # cual en vez de forzarlo a "sin categoría"
-        return
+        return None
     try:
-        edit_kwargs = {
-            'category': categoria_destino,
-            'reason': f'[AntiNuke] Canal devuelto a su categoría original por {_autor_desc(autor)}',
-        }
-        if item.get('posicion') is not None:
-            edit_kwargs['position'] = item['posicion']
-        await canal.edit(**edit_kwargs)
+        await canal.edit(
+            category=categoria_destino,
+            reason=f'[AntiNuke] Canal devuelto a su categoría original por {_autor_desc(autor)}',
+        )
+        return canal, item.get('posicion')
     except Exception as e:
         log.error(f'[AntiNuke] No pude re-parentar canal {canal.name}: {e}')
+        return None
 
 
 async def _procesar_restauracion(guild_id: int):
@@ -654,10 +685,30 @@ async def _procesar_restauracion(guild_id: int):
             #    uno detrás del otro — esto es lo que más tiempo ahorra cuando
             #    el nuke afectó muchos canales a la vez.
             if canales_borrados or canales_reparentar:
-                await asyncio.gather(
+                resultados_extra = await asyncio.gather(
                     *(_crear_canal_borrado(guild, item, mapa_categorias) for item in canales_borrados),
                     *(_reparentar_canal_huerfano(guild, item, mapa_categorias) for item in canales_reparentar),
                 )
+
+                # FIX (canales huérfanos muy lentos): el reparentado de arriba
+                # ya movió cada canal a su categoría correcta (rápido, ver el
+                # FIX en _reparentar_canal_huerfano). Ahora se corrige la
+                # posición exacta dentro de la categoría, aparte y UNA POR
+                # UNA — nunca en paralelo — por el mismo motivo que con las
+                # categorías del paso 1: .edit(position=...) usa el bulk
+                # endpoint compartido de todo el servidor, así que hacerlo a
+                # la vez volvería a ser lento y podría desordenar canales
+                # entre sí dentro de una misma categoría.
+                resultados_reparentados = resultados_extra[len(canales_borrados):]
+                por_posicion = sorted(
+                    (r for r in resultados_reparentados if r is not None and r[1] is not None),
+                    key=lambda t: t[1],
+                )
+                for canal, posicion_original in por_posicion:
+                    try:
+                        await canal.edit(position=posicion_original)
+                    except Exception:
+                        pass
 
             # 4) red de seguridad: reconciliar contra el último snapshot completo
             #    (categorías + canales de adentro). Esto cubre lo que el rastreo
@@ -1740,7 +1791,7 @@ async def _crear_categoria_snapshot(guild: discord.Guild, cid: str, cdata: dict)
         return cid, None
 
 
-async def _reconciliar_canal_en_categoria(guild: discord.Guild, chdata: dict, categoria_destino):
+async def _reconciliar_canal_en_categoria(guild: discord.Guild, chdata: dict, categoria_destino, pendientes_posicion: list):
     """Para un canal del snapshot que pertenecía a una categoría: si el
     nuke lo borró de verdad, lo recrea. Si en cambio sigue vivo (el nuke no
     lo tocó) pero quedó huérfano o en otra categoría, lo devuelve a la
@@ -1748,7 +1799,20 @@ async def _reconciliar_canal_en_categoria(guild: discord.Guild, chdata: dict, ca
     ser así, lo daba por bueno sin fijarse en qué categoría estaba, así que
     un canal que sobrevivió al nuke pero quedó suelto nunca se corregía por
     esta vía (sólo si el tracking en vivo de _procesar_restauracion llegaba
-    a tiempo). Devuelve True si creó o movió algo."""
+    a tiempo). Devuelve True si creó o movió algo.
+
+    FIX (canales huérfanos muy lentos): cuando el canal sólo necesita
+    volver a su categoría (ya existe, sólo está huérfano o mal ubicado),
+    el `.edit()` cambia ÚNICAMENTE `category`, nunca `position` en la
+    misma llamada — mismo motivo que en _reparentar_canal_huerfano:
+    combinar `category` + `position` obliga a discord.py a usar el bulk
+    endpoint compartido de reordenamiento de canales, con un cupo de
+    rate-limit muy ajustado que comparten TODOS los canales/categorías del
+    servidor a la vez, así que restaurar varios de golpe se vuelve muy
+    lento. La posición exacta se agrega a `pendientes_posicion` (lista
+    compartida entre todas las llamadas en paralelo de este lote) para que
+    quien llama la corrija después, aparte y de a una — ver el FIX en
+    _restaurar_desde_snapshot."""
     existente = (
         guild.get_channel(int(chdata['id']))
         or _existe_canal_por_nombre(guild, chdata['name'], categoria_destino)
@@ -1760,9 +1824,10 @@ async def _reconciliar_canal_en_categoria(guild: discord.Guild, chdata: dict, ca
         ):
             try:
                 await existente.edit(
-                    category=categoria_destino, position=chdata.get('position', 0),
+                    category=categoria_destino,
                     reason='[AntiNuke] Canal devuelto a su categoría (restauración por snapshot)',
                 )
+                pendientes_posicion.append((existente, chdata.get('position', 0)))
                 return True
             except Exception as e:
                 log.error(f'[AntiNuke] No pude re-parentar canal existente {chdata["name"]}: {e}')
@@ -1798,7 +1863,7 @@ async def _reconciliar_canal_sin_categoria(guild: discord.Guild, cdata: dict):
         return False
 
 
-async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
+async def _restaurar_desde_snapshot_impl(guild: discord.Guild) -> int:
     """Reconstruye categorías y sus canales a partir del último snapshot
     guardado (server_snapshot.json). Misma lógica que usaba ,an_restore,
     ahora reutilizable para que el antinuke la dispare SOLA apenas detecta
@@ -1869,8 +1934,9 @@ async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
     # 2) canales dentro de cada categoría + canales sin categoría: se
     #    procesan todos juntos y en paralelo (crear los que faltan,
     #    re-parentar los que siguen vivos pero quedaron descolocados)
+    pendientes_posicion: list = []
     tareas_canales = [
-        _reconciliar_canal_en_categoria(guild, chdata, mapa_categorias.get(cid))
+        _reconciliar_canal_en_categoria(guild, chdata, mapa_categorias.get(cid), pendientes_posicion)
         for cid, cdata in gsnap['categories'].items()
         for chdata in cdata['channels']
     ]
@@ -1882,7 +1948,31 @@ async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
         resultados_canales = await asyncio.gather(*tareas_canales)
         restaurados += sum(1 for hizo_algo in resultados_canales if hizo_algo)
 
+    # FIX (canales huérfanos muy lentos): la posición exacta de los canales
+    # que sólo necesitaban volver a su categoría (recogidos arriba en
+    # pendientes_posicion) se corrige aparte y de a una, después del
+    # reparentado rápido — mismo motivo que en _procesar_restauracion.
+    for canal, posicion_original in sorted(pendientes_posicion, key=lambda t: t[1]):
+        try:
+            await canal.edit(position=posicion_original)
+        except Exception:
+            pass
+
     return restaurados
+
+
+async def _restaurar_desde_snapshot(guild: discord.Guild) -> int:
+    """Wrapper con lock — ver `_snapshot_restore_locks` más arriba.
+
+    Todo el que necesite reconciliar contra el snapshot (paso 4 de
+    `_procesar_restauracion`, o el comando `,an_restore`) debe llamar a
+    ESTA función y no directamente a `_restaurar_desde_snapshot_impl`.
+    El lock garantiza que sólo una reconciliación corra a la vez por
+    servidor: si ya hay una en curso, la nueva llamada espera a que
+    termine y, para cuando le toca su turno, ya encuentra todo creado
+    (no duplica nada)."""
+    async with _snapshot_restore_locks[guild.id]:
+        return await _restaurar_desde_snapshot_impl(guild)
 
 
 @bot.command(name='an_restore')
