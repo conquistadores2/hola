@@ -18,6 +18,8 @@ from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
+from utils.embeds import error_embed
+
 load_dotenv()
 
 logging.basicConfig(
@@ -49,7 +51,9 @@ bot = commands.Bot(
 
 EXTENSIONS = (
     "cogs.antinuke_events",
-    "cogs.antinuke_commands",
+    "cogs.whitelist",
+    "cogs.antinukeadmin",
+    "cogs.antinuke",
 )
 
 
@@ -94,11 +98,12 @@ async def on_app_command_error(
         log.exception("Error inesperado en un comando de aplicación", exc_info=error)
         message = "Ocurrió un error inesperado ejecutando el comando."
 
+    embed = error_embed(message)
     try:
         if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
         else:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
     except discord.HTTPException:
         pass
 
@@ -146,7 +151,7 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         message = "Ocurrió un error inesperado ejecutando el comando."
 
     try:
-        await ctx.send(message, ephemeral=True)
+        await ctx.send(embed=error_embed(message), ephemeral=True)
     except discord.HTTPException:
         pass
 
