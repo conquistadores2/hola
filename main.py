@@ -1,6 +1,10 @@
 """
 Bot de Discord con sistema antinuke.
 Arranque: python main.py  (usa la variable de entorno DISCORD_TOKEN)
+
+Todos los comandos son "híbridos": funcionan tanto como comando de barra
+(/antinuke setup) como con el prefijo de texto configurado abajo
+(!antinuke setup). Es el mismo comando y la misma lógica en los dos casos.
 """
 from __future__ import annotations
 
@@ -27,12 +31,21 @@ if not TOKEN:
     log.error("Falta la variable de entorno DISCORD_TOKEN. Configúrala antes de arrancar el bot.")
     sys.exit(1)
 
-intents = discord.Intents.default()
-intents.members = True       # necesario para on_member_join/remove/update
-intents.moderation = True    # necesario para on_member_ban/unban
-# No se activa message_content: todo funciona con slash commands.
+# Prefijo de texto para los comandos (ej: "!", "?", "-"). Configurable con la
+# variable de entorno COMMAND_PREFIX; por defecto "!".
+PREFIX = os.getenv("COMMAND_PREFIX", "!")
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+intents = discord.Intents.default()
+intents.members = True          # necesario para on_member_join/remove/update
+intents.moderation = True       # necesario para on_member_ban/unban
+intents.message_content = True  # necesario para leer comandos con prefijo (ej: "!whitelist add @user")
+
+bot = commands.Bot(
+    command_prefix=PREFIX,
+    intents=intents,
+    help_command=None,
+    case_insensitive=True,
+)
 
 EXTENSIONS = (
     "cogs.antinuke_events",
@@ -52,7 +65,8 @@ async def on_ready() -> None:
     print("=" * 50)
     print(f"  Bot activo: {bot.user}")
     print(f"  Servidores: {len(bot.guilds)}")
-    print("  Antinuke listo. Ejecuta /antinuke setup en cada servidor.")
+    print(f"  Prefijo de texto: {PREFIX}")
+    print("  Antinuke listo. Ejecuta /antinuke setup (o !antinuke setup) en cada servidor.")
     print("=" * 50)
 
 
@@ -63,6 +77,11 @@ async def on_guild_join(guild: discord.Guild) -> None:
     log.info("Bot añadido al servidor '%s' (%s)", guild.name, guild.id)
 
 
+# ---------------------------------------------------------------------- #
+# Errores de comandos de aplicación "puros" (ninguno queda en este bot,
+# pero se deja como red de seguridad por si se agrega alguno en el futuro
+# que NO sea híbrido).
+# ---------------------------------------------------------------------- #
 @bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction, error: app_commands.AppCommandError,
@@ -84,6 +103,54 @@ async def on_app_command_error(
         pass
 
 
+# ---------------------------------------------------------------------- #
+# Errores de comandos híbridos y de prefijo.
+#
+# IMPORTANTE: un comando híbrido (@commands.hybrid_command / hybrid_group)
+# despacha SUS errores acá, en on_command_error, incluso cuando se invocó
+# como "/comando" desde Discord. on_app_command_error (arriba) NO se
+# dispara para comandos híbridos; discord.py los enruta siempre por acá
+# porque por dentro corren sobre el mismo Context, sin importar si vinieron
+# de un mensaje con prefijo o de una interacción de barra.
+# ---------------------------------------------------------------------- #
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+    if isinstance(error, commands.CommandNotFound):
+        return  # sin esto, cualquier "!lo-que-sea" de otro bot loguearía error
+
+    if isinstance(error, commands.NoPrivateMessage):
+        message = "Este comando solo funciona dentro de un servidor."
+    elif isinstance(error, commands.CheckFailure):
+        # Cubre nuestros OwnerOnlyError / AdminOnlyError (traen su propio
+        # mensaje) y cualquier otro check de discord.py que falle.
+        message = str(error) or "No tienes permiso para usar este comando."
+    elif isinstance(error, commands.CommandOnCooldown):
+        message = f"Espera {error.retry_after:.1f}s antes de volver a usar este comando."
+    elif isinstance(error, commands.MissingRequiredArgument):
+        message = f"Falta el parámetro `{error.param.displayed_name or error.param.name}`."
+    elif isinstance(error, commands.BadLiteralArgument):
+        opciones = ", ".join(str(v) for v in error.literals)
+        message = f"«{error.argument}» no es válido para `{error.param.displayed_name or error.param.name}`. Opciones: {opciones}."
+    elif isinstance(error, commands.MemberNotFound):
+        message = f"No encontré ningún miembro «{error.argument}» en este servidor."
+    elif isinstance(error, commands.ChannelNotFound):
+        message = f"No encontré ningún canal «{error.argument}» en este servidor."
+    elif isinstance(error, commands.RoleNotFound):
+        message = f"No encontré ningún rol «{error.argument}» en este servidor."
+    elif isinstance(error, commands.BadBoolArgument):
+        message = f"«{error.argument}» no es un valor válido. Usa true/false (o sí/no, on/off)."
+    elif isinstance(error, commands.BadArgument):
+        message = str(error) or "Uno de los parámetros no es válido."
+    else:
+        log.exception("Error inesperado en un comando", exc_info=error)
+        message = "Ocurrió un error inesperado ejecutando el comando."
+
+    try:
+        await ctx.send(message, ephemeral=True)
+    except discord.HTTPException:
+        pass
+
+
 async def main() -> None:
     async with bot:
         for extension in EXTENSIONS:
@@ -101,6 +168,6 @@ if __name__ == "__main__":
     except discord.PrivilegedIntentsRequired:
         log.error(
             "Faltan intents privilegiados. Ve al Developer Portal -> tu app -> Bot "
-            "y activa 'SERVER MEMBERS INTENT'."
+            "y activa 'SERVER MEMBERS INTENT' y 'MESSAGE CONTENT INTENT'."
         )
         sys.exit(1)
