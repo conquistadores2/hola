@@ -152,15 +152,41 @@ discord-antinuke-bot/
 ├── main.py                     # arranque del bot
 ├── cogs/
 │   ├── antinuke_events.py      # detección y castigo automático
-│   └── antinuke_commands.py    # /whitelist, /antinukeadmin, /antinuke
+│   ├── whitelist.py            # /whitelist add|remove|list
+│   ├── antinukeadmin.py        # /antinukeadmin add|remove|list
+│   └── antinuke.py             # /antinuke setup|settings|punishment|module + /help
 ├── utils/
-│   └── database.py             # guardado en JSON por servidor
+│   ├── database.py             # guardado en JSON por servidor
+│   ├── permissions.py          # owner_only/admin_only + cog base (guild-only)
+│   └── embeds.py               # embeds compartidos (error=rojo, success=verde, info=azul)
 ├── requirements.txt
 ├── Procfile
 ├── .python-version
 ├── .env.example
 └── .gitignore
 ```
+
+Los 3 cogs de comandos (`whitelist.py`, `antinukeadmin.py`, `antinuke.py`)
+heredan de `AntiNukeCogBase` (en `utils/permissions.py`), que exige que el
+comando se use dentro de un servidor. Los checks `owner_only()`/`admin_only()`
+y los embeds (`error_embed`/`success_embed`/`info_embed`) también se
+importan de `utils/`, así que la lógica de permisos y la apariencia no se
+repiten en cada archivo.
+
+## Comandos y embeds
+
+Todas las respuestas del bot son embeds (nunca texto plano), con un color
+según el resultado:
+
+| Color | Cuándo se usa |
+|---|---|
+| 🔴 Rojo | Errores: sin permiso, algo no encontrado, argumento inválido, algo que ya estaba en ese estado |
+| 🟢 Verde | Se acaba de aplicar un cambio con éxito (agregar, quitar, configurar, activar/desactivar) |
+| 🔵 Azul | Solo información: listas, configuración actual, uso de un comando, `/help` |
+
+`/help` (o `!ayuda`) agrupa los comandos por quién los puede usar (dueño /
+admin del antinuke / cualquiera), para saber de un vistazo qué está
+disponible según el rol.
 
 ## Problemas comunes
 
