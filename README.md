@@ -4,6 +4,10 @@ Bot con sistema **antinuke** que detecta y castiga automáticamente acciones
 destructivas hechas por cuentas no autorizadas (incluso si tienen permiso de
 Administrador de Discord — ese es justamente el punto).
 
+Todos los comandos de configuración funcionan tanto como **slash** (`/comando`)
+como con **prefijo de texto** (`!comando` por defecto, configurable). Es el
+mismo comando en los dos casos — usa el que te resulte más cómodo.
+
 ## Qué protege
 
 | Módulo | Qué detecta |
@@ -25,8 +29,11 @@ castigo configurado (ban por defecto), y lo reporta en el canal de logs.
 
 1. Ve a https://discord.com/developers/applications → **New Application**.
 2. En la pestaña **Bot** → **Reset Token** → copia el token (lo vas a necesitar en Railway).
-3. En esa misma pestaña, activa **SERVER MEMBERS INTENT** (obligatorio). No hace
-   falta activar "Message Content Intent" porque todo funciona con comandos slash (`/`).
+3. En esa misma pestaña, activa **SERVER MEMBERS INTENT** y **MESSAGE CONTENT
+   INTENT** (los dos son obligatorios). El primero es para detectar altas/bajas
+   de miembros; el segundo es para que el bot pueda leer los comandos escritos
+   con prefijo (ej. `!whitelist list`). Si solo usaras comandos `/`, no haría
+   falta el segundo — pero como este bot soporta ambos, hay que activarlo.
 4. En **OAuth2 → URL Generator**: marca el scope `bot` y `applications.commands`.
    En permisos, lo más simple y confiable es marcar **Administrator** (así el
    antinuke nunca se queda sin poder actuar). Si prefieres algo más granular,
@@ -59,6 +66,7 @@ python main.py
 4. Ve a la pestaña **Variables** del servicio y agrega:
    - `DISCORD_TOKEN` = el token que copiaste antes
    - `DATA_DIR` = `/data` (ver el paso del Volume abajo)
+   - `COMMAND_PREFIX` = `!` (opcional; cambia el prefijo de texto, ej. `?` o `-`)
 5. **Agrega un Volume** (pestaña *Volumes* del servicio) montado en `/data`.
    Esto es importante: sin un Volume, la whitelist y la configuración se
    **borran** cada vez que Railway vuelve a desplegar el servicio, porque el
@@ -71,12 +79,17 @@ python main.py
 
 ## 4. Primeros comandos (dentro de Discord)
 
+**Todos los comandos funcionan de las dos formas** — como slash (`/comando`,
+con autocompletado de Discord) o escritos con el prefijo de texto (por
+defecto `!`, configurable con `COMMAND_PREFIX`). Es el mismo comando y el
+mismo resultado; usa la que prefieras.
+
 Ejecuta esto como dueño del servidor:
 
 ```
-/antinuke setup canal:#logs-seguridad
-/antinukeadmin add usuario:@TuManoDerecha
-/whitelist add usuario:@TuManoDerecha
+/antinuke setup canal:#logs-seguridad          !antinuke setup #logs-seguridad
+/antinukeadmin add usuario:@TuManoDerecha      !antinukeadmin add @TuManoDerecha
+/whitelist add usuario:@TuManoDerecha          !whitelist add @TuManoDerecha
 ```
 
 - `/antinuke setup` — define el canal donde se reportan los castigos.
@@ -86,7 +99,7 @@ Ejecuta esto como dueño del servidor:
   (para tu staff de confianza y otros bots que uses). Lo puede usar el
   dueño o cualquier admin del antinuke.
 
-Otros comandos útiles:
+Otros comandos útiles (formato slash; todos tienen su equivalente con `!`):
 
 ```
 /antinuke settings              # ver toda la configuración actual
@@ -94,6 +107,7 @@ Otros comandos útiles:
 /antinuke module modulo:role_create estado:false   # apagar un módulo puntual
 /whitelist list
 /antinukeadmin list
+/help                           # (o "!ayuda") lista todos los comandos
 ```
 
 ## Jerarquía de permisos
@@ -150,13 +164,19 @@ discord-antinuke-bot/
 
 ## Problemas comunes
 
-- **`PrivilegedIntentsRequired`**: activa "SERVER MEMBERS INTENT" en el
-  Developer Portal (paso 1.3).
+- **`PrivilegedIntentsRequired`**: activa "SERVER MEMBERS INTENT" **y**
+  "MESSAGE CONTENT INTENT" en el Developer Portal (paso 1.3). Faltan los
+  dos, no solo uno.
 - **`LoginFailure` / token inválido**: reseteá el token en el Developer
   Portal y actualizá la variable `DISCORD_TOKEN` en Railway.
 - **Los comandos `/` no aparecen**: pueden tardar hasta 1 hora en
   propagarse la primera vez a nivel global; reiniciar Discord (Ctrl+R)
   suele mostrarlos antes.
+- **Los comandos con prefijo (`!comando`) no responden nada**: casi
+  siempre es porque falta activar "MESSAGE CONTENT INTENT" en el Developer
+  Portal (paso 1.3) — sin ese intent, discord.py no puede leer el texto de
+  los mensajes y los ignora en silencio. Los comandos `/` seguirían
+  funcionando igual.
 - **El bot no castiga a nadie**: revisá que su rol esté por encima del rol
   del que quieres poder castigar, y que tenga permiso de "Ver registro de
   auditoría".
