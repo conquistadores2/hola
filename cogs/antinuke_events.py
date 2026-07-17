@@ -17,14 +17,13 @@ Cosas importantes de diseño (léelas antes de tocar el código):
    "Ver registro de auditoría" (View Audit Log) para el bot.
 
 3. Se usa un sistema de "umbral" (threshold): cuenta cuántas veces un
-   usuario disparó cada acción en una ventana corta de segundos. Está
-   configurado en modo **máxima sensibilidad**: el umbral de TODO es 1,
-   o sea que una sola acción ya dispara el castigo, sin esperar a que se
-   repita. Esto hace la detección lo más rápida posible, pero también
-   quiere decir que hay CERO tolerancia — si alguien de tu staff borra
-   un solo canal o rol por error y no está en la whitelist, se lo va a
-   castigar igual. Agrega a tu staff de confianza a la whitelist
-   (`/whitelist add`) para que quede exento.
+   usuario disparó cada acción en una ventana corta de segundos. El
+   límite (cuántas veces hace falta) es configurable por servidor con
+   `/antinuke limit` y se guarda en config["thresholds"] — por defecto
+   viene en 1 para todo (máxima sensibilidad: una sola acción ya
+   castiga, sin esperar a que se repita). CERO tolerancia por defecto
+   quiere decir que hay que whitelistear a tu staff de confianza
+   (`/whitelist add`) o se lo va a castigar en su primer movimiento.
 """
 from __future__ import annotations
 
@@ -55,20 +54,19 @@ DANGEROUS_PERMS = (
     "moderate_members",
 )
 
-# (límite de eventos, ventana en segundos) por tipo de acción.
-# Límite en 1 para todo = máxima sensibilidad: la primera vez que alguien
-# no exento hace la acción, ya se lo castiga (no hace falta que la repita).
-# La ventana (segundo valor) queda para el día que quieras subirle la
-# tolerancia a algún módulo puntual sin tener que rediseñar nada.
-THRESHOLDS: dict[str, tuple[int, int]] = {
-    "channel_delete": (1, 8),
-    "channel_create": (1, 8),
-    "role_delete": (1, 8),
-    "role_create": (1, 8),
-    "ban": (1, 10),
-    "kick": (1, 10),
-    "webhook_create": (1, 5),
-    "emoji_delete": (1, 10),
+# Ventana en segundos por tipo de acción: cuánto tiempo se cuentan los
+# hits para el umbral. El LÍMITE (cuántas veces hace falta) ya NO está
+# acá — es configurable por servidor con /antinuke limit y se lee de
+# config["thresholds"] (ver utils/database.py, DEFAULT_THRESHOLDS).
+WINDOWS: dict[str, int] = {
+    "channel_delete": 8,
+    "channel_create": 8,
+    "role_delete": 8,
+    "role_create": 8,
+    "ban": 10,
+    "kick": 10,
+    "webhook_create": 5,
+    "emoji_delete": 10,
 }
 
 # Cuánto esperar (segundos) a que el audit log de Discord se actualice
@@ -167,7 +165,8 @@ class AntiNukeEvents(commands.Cog):
         if is_exempt(guild, config, executor.id):
             return
 
-        limit, window = THRESHOLDS.get(action_name, (1, 5))
+        limit = config.get("thresholds", {}).get(action_name, 1)
+        window = WINDOWS.get(action_name, 8)
         triggered = self.tracker.hit(guild.id, executor.id, action_name, limit, window)
         if not triggered:
             return
