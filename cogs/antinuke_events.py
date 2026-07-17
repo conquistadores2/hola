@@ -24,6 +24,18 @@ Cosas importantes de diseño (léelas antes de tocar el código):
    castiga, sin esperar a que se repita). CERO tolerancia por defecto
    quiere decir que hay que whitelistear a tu staff de confianza
    (`/whitelist add`) o se lo va a castigar en su primer movimiento.
+
+4. fetch_executor() reintenta en vez de esperar siempre AUDIT_LOG_DELAY
+   completo: consulta apenas entra el evento y, si el audit log todavía
+   no lo tiene, reintenta cada AUDIT_LOG_RETRY_INTERVAL hasta encontrarlo
+   o hasta agotar el tope. En la práctica reacciona bastante antes del
+   máximo. Aun así, hay un piso que no se puede bajar más: Discord tarda
+   un rato en publicar cada entrada del audit log, y cada acción (ban,
+   borrar canal, etc.) es una llamada HTTP con su propia latencia — el
+   bot SIEMPRE actúa después de la acción, nunca antes. Si alguien corre
+   un script que borra todo en milisegundos, el antinuke va a banear al
+   responsable apenas lo identifique, pero no puede deshacer lo que ya se
+   borró (eso no lo soluciona ningún antinuke reactivo, de ningún bot).
 """
 from __future__ import annotations
 
@@ -69,10 +81,13 @@ WINDOWS: dict[str, int] = {
     "emoji_delete": 10,
 }
 
-# Cuánto esperar (segundos) a que el audit log de Discord se actualice
-# antes de leerlo. Sin esto, a veces se lee el log ANTES de que la
-# entrada nueva aparezca y no se encuentra al ejecutor.
+# Cuánto esperar COMO MÁXIMO (segundos) a que el audit log de Discord se
+# actualice antes de rendirse. No es una espera fija: fetch_executor()
+# reintenta cada AUDIT_LOG_RETRY_INTERVAL en vez de dormir siempre el
+# total de una — así, cuando el audit log ya está listo (lo más común),
+# se reacciona mucho antes de llegar a este tope.
 AUDIT_LOG_DELAY = 1.2
+AUDIT_LOG_RETRY_INTERVAL = 0.3
 AUDIT_LOG_MAX_AGE = 8  # ignorar entradas de audit log más viejas que esto
 
 
@@ -118,27 +133,36 @@ async def fetch_executor(
     target_id: int | None = None,
     max_age: int = AUDIT_LOG_MAX_AGE,
 ):
-    """Busca en el audit log quién ejecutó una acción reciente. Devuelve un User/Member o None."""
+    """Busca en el audit log quién ejecutó una acción reciente. Devuelve un
+    User/Member o None.
+
+    Reintenta cada AUDIT_LOG_RETRY_INTERVAL hasta encontrar la entrada o
+    hasta agotar AUDIT_LOG_DELAY en total. Esto reacciona apenas el audit
+    log esté listo en vez de esperar siempre el máximo — en la práctica
+    suele resolver bastante antes del tope."""
     me = guild.me
     if me is None or not me.guild_permissions.view_audit_log:
         return None
 
-    await asyncio.sleep(AUDIT_LOG_DELAY)
+    deadline = time.monotonic() + AUDIT_LOG_DELAY
+    while True:
+        try:
+            async for entry in guild.audit_logs(limit=8, action=action):
+                age = (discord.utils.utcnow() - entry.created_at).total_seconds()
+                if age > max_age:
+                    break  # esta y el resto (más viejas todavía) ya no sirven
+                if target_id is not None:
+                    target = entry.target
+                    tid = getattr(target, "id", target)
+                    if tid != target_id:
+                        continue
+                return entry.user
+        except discord.Forbidden:
+            return None
 
-    try:
-        async for entry in guild.audit_logs(limit=8, action=action):
-            age = (discord.utils.utcnow() - entry.created_at).total_seconds()
-            if age > max_age:
-                return None
-            if target_id is not None:
-                target = entry.target
-                tid = getattr(target, "id", target)
-                if tid != target_id:
-                    continue
-            return entry.user
-    except discord.Forbidden:
-        return None
-    return None
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(AUDIT_LOG_RETRY_INTERVAL)
 
 
 class AntiNukeEvents(commands.Cog):
@@ -183,12 +207,6 @@ class AntiNukeEvents(commands.Cog):
         punishment = config.get("punishment", "ban")
         member = guild.get_member(executor.id)
 
-        if member is not None:
-            try:
-                await member.edit(roles=[], reason=f"[AntiNuke] {reason}")
-            except discord.HTTPException:
-                pass
-
         try:
             if punishment == "ban":
                 await guild.ban(
@@ -198,7 +216,8 @@ class AntiNukeEvents(commands.Cog):
                 )
             elif punishment == "kick" and member is not None:
                 await guild.kick(member, reason=f"[AntiNuke] {reason}")
-            # si punishment == "strip", ya alcanzó con quitarle los roles arriba
+            elif punishment == "strip" and member is not None:
+                await member.edit(roles=[], reason=f"[AntiNuke] {reason}")
         except discord.Forbidden:
             log.warning(
                 "Sin permisos suficientes para castigar a %s en %s (%s)",
