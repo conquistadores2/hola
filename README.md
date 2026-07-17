@@ -105,6 +105,7 @@ Otros comandos útiles (formato slash; todos tienen su equivalente con `!`):
 /antinuke settings              # ver toda la configuración actual
 /antinuke punishment tipo:kick  # cambiar el castigo (ban / kick / strip)
 /antinuke module modulo:role_create estado:false   # apagar un módulo puntual
+/antinuke limit modulo:channel_delete cantidad:3   # castigar recién al 3er canal borrado
 /whitelist list
 /antinukeadmin list
 /help                           # (o "!ayuda") lista todos los comandos
@@ -133,11 +134,15 @@ proteger el servidor incluso si una cuenta con admin se compromete.
   veces tarda uno o dos segundos en actualizarse. El bot ya espera un poco
   antes de consultarlo, pero en ataques extremadamente rápidos podría no
   alcanzar a identificar al ejecutor a tiempo.
-- Los umbrales (ej. "2 canales borrados en 8 segundos") están pensados para
-  máxima seguridad. Si tu staff hace tareas masivas legítimas seguido
-  (crear/borrar muchos canales o roles de golpe), **agrégalos a la
-  whitelist** o van a terminar castigados — es el trade-off de tener
-  seguridad estricta.
+- Los umbrales vienen por defecto en **máxima sensibilidad**: una sola
+  acción (1 canal borrado, 1 ban, etc.) ya dispara el castigo, sin esperar
+  a que se repita. Si tu staff hace tareas legítimas de este tipo
+  (crear/borrar canales o roles, banear gente), **agrégalos a la
+  whitelist** (`/whitelist add`) o van a terminar castigados en el primer
+  intento — es el trade-off de tener cero tolerancia. Si preferís darle
+  algo de margen a un módulo puntual (ej. permitir hasta 3 canales
+  borrados antes de castigar), usá `/antinuke limit modulo:channel_delete
+  cantidad:3` — no hace falta tocar código, se guarda por servidor.
 - Si le quitan al bot su propio rol o lo expulsan/banean, no hay forma de
   que el bot lo evite desde dentro de discord.py; por eso el rol del bot
   debe estar alto en la jerarquía y solo gente de confianza debería tener
