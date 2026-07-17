@@ -144,6 +144,13 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
         message = f"No encontré ningún rol «{error.argument}» en este servidor."
     elif isinstance(error, commands.BadBoolArgument):
         message = f"«{error.argument}» no es un valor válido. Usa true/false (o sí/no, on/off)."
+    elif isinstance(error, commands.RangeError):
+        limites = []
+        if error.minimum is not None:
+            limites.append(f"mínimo {error.minimum}")
+        if error.maximum is not None:
+            limites.append(f"máximo {error.maximum}")
+        message = f"«{error.value}» está fuera de rango ({', '.join(limites)})."
     elif isinstance(error, commands.BadArgument):
         message = str(error) or "Uno de los parámetros no es válido."
     else:
