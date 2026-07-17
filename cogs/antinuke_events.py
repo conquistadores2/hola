@@ -71,14 +71,14 @@ DANGEROUS_PERMS = (
 # acá — es configurable por servidor con /antinuke limit y se lee de
 # config["thresholds"] (ver utils/database.py, DEFAULT_THRESHOLDS).
 WINDOWS: dict[str, int] = {
-    "channel_delete": 2,
-    "channel_create": 2,
-    "role_delete": 2,
-    "role_create": 2,
-    "ban": 2,
-    "kick": 2,
-    "webhook_create": 2,
-    "emoji_delete": 2,
+    "channel_delete": 1,
+    "channel_create": 1,
+    "role_delete": 1,
+    "role_create": 1,
+    "ban": 1,
+    "kick": 1,
+    "webhook_create": 1,
+    "emoji_delete": 1,
 }
 
 # Cuánto esperar COMO MÁXIMO (segundos) a que el audit log de Discord se
@@ -86,7 +86,7 @@ WINDOWS: dict[str, int] = {
 # reintenta cada AUDIT_LOG_RETRY_INTERVAL en vez de dormir siempre el
 # total de una — así, cuando el audit log ya está listo (lo más común),
 # se reacciona mucho antes de llegar a este tope.
-AUDIT_LOG_DELAY = 0.7
+AUDIT_LOG_DELAY = 0.4
 AUDIT_LOG_RETRY_INTERVAL = 0.1
 AUDIT_LOG_MAX_AGE = 8  # ignorar entradas de audit log más viejas que esto
 
