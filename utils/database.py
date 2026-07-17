@@ -39,6 +39,21 @@ DEFAULT_MODULES = {
     "emoji_delete": True,
 }
 
+# Cuántas veces hace falta que se repita una acción antes de castigar.
+# Solo aplica a los módulos que se cuentan en una ventana de tiempo (ver
+# WINDOWS en cogs/antinuke_events.py); bot_add/dangerous_role/guild_update
+# no están acá porque esos siempre actúan al instante, sin contar nada.
+DEFAULT_THRESHOLDS = {
+    "channel_delete": 1,
+    "channel_create": 1,
+    "role_delete": 1,
+    "role_create": 1,
+    "ban": 1,
+    "kick": 1,
+    "webhook_create": 1,
+    "emoji_delete": 1,
+}
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "owner_id": None,
     "admins": [],
@@ -46,6 +61,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_channel": None,
     "punishment": "ban",  # ban | kick | strip
     "modules": DEFAULT_MODULES,
+    "thresholds": DEFAULT_THRESHOLDS,
 }
 
 
@@ -70,6 +86,7 @@ def get_config(guild_id: int) -> dict[str, Any]:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     config.update(data)
     config["modules"] = {**DEFAULT_MODULES, **data.get("modules", {})}
+    config["thresholds"] = {**DEFAULT_THRESHOLDS, **data.get("thresholds", {})}
     return config
 
 
