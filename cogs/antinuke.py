@@ -24,12 +24,22 @@ MODULE_CHOICES = [
     "guild_update", "emoji_delete",
 ]
 
+# Los únicos módulos que "cuentan" repeticiones (ver WINDOWS en
+# cogs/antinuke_events.py) y por lo tanto tienen un límite ajustable.
+# bot_add/dangerous_role/guild_update quedan afuera: esos siempre
+# castigan al instante, no hay nada que ajustar.
+THRESHOLD_MODULES = [
+    "channel_delete", "channel_create", "role_delete", "role_create",
+    "ban", "kick", "webhook_create", "emoji_delete",
+]
+
 # typing.Literal con los valores válidos: discord.py lo convierte
 # automáticamente en choices en el slash command y en un validador de
 # texto en el comando con prefijo. Se arma dinámicamente para no repetir
-# MODULE_CHOICES a mano.
+# las listas de arriba a mano.
 PunishmentChoice = Literal["ban", "kick", "strip"]
 ModuleChoice = Literal[tuple(MODULE_CHOICES)]
+ThresholdModuleChoice = Literal[tuple(THRESHOLD_MODULES)]
 
 
 class AntinukeCommands(AntiNukeCogBase):
@@ -41,7 +51,7 @@ class AntinukeCommands(AntiNukeCogBase):
     async def antinuke(self, ctx: commands.Context) -> None:
         prefix = ctx.prefix if ctx.interaction is None else "/"
         await ctx.send(
-            embed=info_embed(f"`{prefix}antinuke setup|settings|punishment|module`", title="⚙️ Antinuke"),
+            embed=info_embed(f"`{prefix}antinuke setup|settings|punishment|module|limit`", title="⚙️ Antinuke"),
             ephemeral=True,
         )
 
@@ -80,6 +90,30 @@ class AntinukeCommands(AntiNukeCogBase):
             ephemeral=True,
         )
 
+    @antinuke.command(
+        name="limit",
+        description="Define cuántas veces hace falta una acción antes de castigar (1 = al instante)",
+    )
+    @app_commands.describe(
+        modulo="Módulo a ajustar (solo los que cuentan repeticiones)",
+        cantidad="Cuántas veces hace falta en pocos segundos para castigar (1 a 20)",
+    )
+    @admin_only()
+    async def antinuke_limit(
+        self,
+        ctx: commands.Context,
+        modulo: ThresholdModuleChoice,
+        cantidad: commands.Range[int, 1, 20],
+    ) -> None:
+        config = database.get_config(ctx.guild.id)
+        config.setdefault("thresholds", {})[modulo] = cantidad
+        database.save_config(ctx.guild.id, config)
+        detalle = "al instante (1ª vez ya castiga)" if cantidad == 1 else f"recién a la {cantidad}ª repetición"
+        await ctx.send(
+            embed=success_embed(f"`{modulo}` ahora castiga {detalle}."),
+            ephemeral=True,
+        )
+
     @antinuke.command(name="settings", description="Muestra la configuración actual del antinuke")
     async def antinuke_settings(self, ctx: commands.Context) -> None:
         config = database.get_config(ctx.guild.id)
@@ -97,8 +131,18 @@ class AntinukeCommands(AntiNukeCogBase):
         embed.add_field(name="Whitelist", value=whitelist, inline=False)
 
         modules = config.get("modules", {})
-        mod_text = "\n".join(f"{'🟢' if v else '🔴'} `{k}`" for k, v in modules.items())
-        embed.add_field(name="Módulos", value=mod_text or "N/A", inline=False)
+        thresholds = config.get("thresholds", {})
+
+        tunable = "\n".join(
+            f"{'🟢' if modules.get(k, True) else '🔴'} `{k}` — límite: {thresholds[k]}"
+            for k in database.DEFAULT_THRESHOLDS
+        )
+        instant = "\n".join(
+            f"{'🟢' if modules.get(k, True) else '🔴'} `{k}`"
+            for k in modules if k not in database.DEFAULT_THRESHOLDS
+        )
+        embed.add_field(name="Módulos con límite ajustable", value=tunable or "N/A", inline=False)
+        embed.add_field(name="Módulos siempre instantáneos", value=instant or "N/A", inline=False)
 
         await ctx.send(embed=embed, ephemeral=True)
 
@@ -133,7 +177,8 @@ class AntinukeCommands(AntiNukeCogBase):
                 "`whitelist add <usuario>` — exime a alguien de los castigos\n"
                 "`whitelist remove <usuario>` — vuelve a exponer a alguien\n"
                 "`antinuke punishment <ban|kick|strip>` — castigo por defecto\n"
-                "`antinuke module <módulo> <on|off>` — activa/desactiva una protección"
+                "`antinuke module <módulo> <on|off>` — activa/desactiva una protección\n"
+                "`antinuke limit <módulo> <1-20>` — repeticiones antes de castigar"
             ),
             inline=False,
         )
