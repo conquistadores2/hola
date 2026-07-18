@@ -54,6 +54,7 @@ EXTENSIONS = (
     "cogs.whitelist",
     "cogs.antinukeadmin",
     "cogs.antinuke",
+    "cogs.backups",
 )
 
 
